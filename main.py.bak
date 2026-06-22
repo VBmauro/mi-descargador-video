@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+Universal Video Downloader - Version Mejorada
+Soporta: YouTube, TikTok, Facebook, Instagram, Twitter, y mas
+Caracteristicas:
+  - Auto-update completo al iniciar (app + motor + paquetes)
+  - Descarga de video + audio (mejor calidad)
+  - Seleccion de formato manual
+  - Solo audio (MP3 192kbps)
+  - Descarga por lotes desde archivo
+  - Barra de progreso en vivo
+"""
+
+import os
+import sys
+import subprocess
+
+import conf_management as cfg
+
+# --- CONSTANTES DE ACTUALIZACION ---
+APP_VERSION = "2.1.0"
+# CAMBIA ESTO: pon tu usuario de GitHub donde dice TU_USUARIO
+MI_USUARIO_GITHUB = "VBmauro"  # <--- CAMBIA ESTO por tu usuario de GitHub
+APP_VERSION_URL = f"https://raw.githubusercontent.com/{MI_USUARIO_GITHUB}/UniversalDownloader/main/version.txt"
+APP_DOWNLOAD_URL = f"https://raw.githubusercontent.com/{MI_USUARIO_GITHUB}/UniversalDownloader/main/main.py"
+
+# Importar yt-dlp (si no existe, se instalara al iniciar)
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
+
+# --- Auto-update completo al iniciar ---------------------
+
+def _ejecutar_pip(comando):
+    """Ejecuta pip silenciosamente"""
+    subprocess.check_call(
+        [sys.executable, "-m", "pip"] + comando,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+
+def _version_normalizada(v):
+    """Convierte '2026.06.09' y '2026.6.9' al mismo formato para comparar"""
+    return ".".join(str(int(x)) for x in v.split("."))
+
+
+def _actualizar_pip():
+    """Actualiza pip mismo (importante en Termux/Android)"""
+    try:
+        _ejecutar_pip(["install", "-U", "pip", "-q"])
+    except:
+        pass
+
+
+def _actualizar_paquetes():
+    """Actualiza requests y otras dependencias pip"""
+    for pkg in ["requests", "certifi"]:
+        try:
+            _ejecutar_pip(["install", "-U", pkg, "-q"])
+        except:
+            pass
+
+
+def _instalar_ytdlp():
+    """Instala yt-dlp si no esta presente y reinicia"""
+    global yt_dlp
+    print("Instalando motor de descargas (yt-dlp)...")
+    try:
+        _ejecutar_pip(["install", "yt-dlp", "-q"])
+        print("Instalado. Reiniciando...")
+        os.execl(sys.executable, sys.executable, *sys.argv)
+    except Exception as e:
+        print(f"Error instalando: {e}")
+        print("Ejecuta manualmente: pip install yt-dlp")
+        sys.exit(1)
+
+
+def _actualizar_ytdlp():
+    """Verifica y actualiza yt-dlp desde PyPI"""
+    global yt_dlp
+
+    if yt_dlp is None:
+        _instalar_ytdlp()
+        return False
+
+    try:
+        import requests
+    except ImportError:
+        return False
+
+    try:
+        resp = requests.get(
+            "https://pypi.org/pypi/yt-dlp/json",
+            headers={"User-Agent": f"UniversalDownloader/{APP_VERSION}"},
+            timeout=5
+        )
+        latest_raw = resp.json()["info"]["version"]
+        current_raw = yt_dlp.version.__version__
+
+        latest = _version_normalizada(latest_raw)
+        current = _version_normalizada(current_raw)
+
+        if latest != current:
+            print(f"Actualizando motor: {current_raw} -> {latest_raw}...")
+            _ejecutar_pip(["install", "-U", "yt-dlp", "-q"])
+            print("Actualizado. Reiniciando...")
+            os.execl(sys.executable, sys.executable, *sys.argv)
+            return True
+        else:
+            print(f"Motor actualizado ({current_raw})")
+            return False
+    except Exception as e:
+        print(f"No se pudo verificar yt-dlp: {e}")
+        return False
+
+
+def _auto_actualizar_app():
+    """Descarga y reemplaza este script si hay version nueva en GitHub"""
+    try:
+        import requests
+        resp = requests.get(APP_VERSION_URL, timeout=5)
+        if resp.status_code != 200:
+            return False
+
+        latest_version = resp.text.strip()
+        if not latest_version:
+            return False
+
+        if _version_normalizada(latest_version) <= _version_normalizada(APP_VERSION):
+            return False
+
+        print(f"Actualizando app: v{APP_VERSION} -> v{latest_version}...")
+
+        resp = requests.get(APP_DOWNLOAD_URL, timeout=15)
+        if resp.status_code != 200:
+            print("Error descargando actualizacion")
+            return False
+
+        # Reemplazar este script con la nueva version
+        ruta_actual = os.path.abspath(__file__)
+        ruta_backup = ruta_actual + ".bak"
+        try:
+            os.remove(ruta_backup)
+        except:
+            pass
+        os.rename(ruta_actual, ruta_backup)
+        with open(ruta_actual, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        print("App actualizada. Reiniciando...")
+        os.execl(sys.executable, sys.executable, ruta_actual)
+        return True
+    except Exception as e:
+        print(f"Auto-actualizacion no disponible: {e}")
+        return False
+
+
+def _tiene_ffmpeg():
+    """Verifica silenciosamente si ffmpeg esta instalado"""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return True
+    except:
+        return False
+
+
+def _verificar_ffmpeg():
+    """Verifica ffmpeg y da instrucciones para Android/Windows"""
+    if _tiene_ffmpeg():
+        return True
+    print("")
+    print("ATENCION: ffmpeg no encontrado")
+    print("Para mejor calidad y audio MP3, instala ffmpeg:")
+    print("  Android (Termux): pkg install ffmpeg")
+    print("  Windows: descarga de https://ffmpeg.org/download.html")
+    print("  y agregalo al PATH del sistema")
+    print("Por ahora se usara formato progresivo (max 720p)")
+    return False
+
+
+def verificar_actualizaciones():
+    """Ejecuta TODAS las actualizaciones antes de entrar al menu"""
+    print("=" * 52)
+    print("  INICIANDO UNIVERSAL VIDEO DOWNLOADER")
+    print(f"  Version: {APP_VERSION}")
+    print("=" * 52)
+    print("")
+
+    # 1. Actualizar pip (critico en Termux)
+    try:
+        _actualizar_pip()
+    except:
+        pass
+
+    # 2. Actualizar paquetes base (requests, etc.)
+    try:
+        _actualizar_paquetes()
+    except:
+        pass
+
+    # 3. Auto-actualizar el script desde GitHub
+    print("[1/4] Verificando actualizacion de la app...")
+    try:
+        _auto_actualizar_app()
+    except:
+        print("  Auto-actualizacion no disponible (configura APP_VERSION_URL)")
+
+    # 4. Actualizar yt-dlp (motor de descargas)
+    print("[2/4] Verificando motor de descargas...")
+    _actualizar_ytdlp()
+
+    # 5. Verificar ffmpeg
+    print("[3/4] Verificando dependencias del sistema...")
+    _verificar_ffmpeg()
+
+    print("[4/4] Listo.")
+    print("")
+
+
+# --- Utilidades -----------------------------------------
+
+def limpiar_pantalla():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def obtener_ruta_descargas():
+    ruta = cfg.get_ruta_descargas()
+    os.makedirs(ruta, exist_ok=True)
+    return ruta
+
+
+def crear_directorios(base):
+    for d in ["video", "audio"]:
+        os.makedirs(os.path.join(base, d), exist_ok=True)
+
+
+
+
+
+# --- Progreso -------------------------------------------
+
+_ultimo_progreso = [0]
+
+
+def hook_progreso(d):
+    if d["status"] == "downloading":
+        try:
+            p = d.get("_percent_str", "0%").strip().replace("%", "")
+            percent = float(p)
+            if percent - _ultimo_progreso[0] >= 2 or percent == 0:
+                _ultimo_progreso[0] = percent
+                eta = d.get("_eta_str", "?")
+                vel = d.get("_speed_str", "?")
+                barra = "#" * int(percent // 5) + "-" * (20 - int(percent // 5))
+                print(f"\r   [{barra}] {p}% | ETA: {eta} | {vel}  ", end="", flush=True)
+        except:
+            pass
+    elif d["status"] == "finished":
+        print(f"\r   Descargado                          ")
+
+
+# --- Descargas ------------------------------------------
+
+def descargar_video(url, destino):
+    """Descarga el mejor video + audio disponible"""
+    print(f"\nDescargando video...")
+
+    if _tiene_ffmpeg():
+        formato = "bestvideo+bestaudio/best"
+    else:
+        print("   Aviso: ffmpeg no instalado. Usando formato progresivo (max 720p).")
+        formato = "best"
+
+    ydl_opts = {
+        "outtmpl": os.path.join(destino, "video", "%(title)s.%(ext)s"),
+        "format": formato,
+        "merge_output_format": "mp4",
+        "progress_hooks": [hook_progreso],
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    print(f"   {info.get('title', 'Video')}")
+    print(f"   Guardado en: {os.path.join(destino, 'video')}")
+
+
+def descargar_audio(url, destino):
+    """Descarga solo audio, con o sin ffmpeg"""
+    print(f"\nDescargando audio...")
+
+    ydl_opts = {
+        "outtmpl": os.path.join(destino, "audio", "%(title)s.%(ext)s"),
+        "format": "bestaudio/best",
+        "progress_hooks": [hook_progreso],
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    if _tiene_ffmpeg():
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    else:
+        print("   Aviso: ffmpeg no instalado. Audio en formato original.")
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    print(f"   {info.get('title', 'Audio')}")
+    print(f"   Guardado en: {os.path.join(destino, 'audio')}")
+
+
+def descargar_con_formato(url, destino):
+    """Lista formatos y permite seleccionar uno"""
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        print(f"\nTitulo: {info.get('title', '?')}")
+        print(f"   Autor: {info.get('uploader', '?')}")
+        print(f"   Duracion: {info.get('duration_string', '?')}")
+
+        formatos = info.get("formats", [])
+        opciones = []
+        for i, f in enumerate(formatos):
+            ext = f.get("ext", "?")
+            nota = f.get("format_note", f.get("resolution", "?"))
+            size = f.get("filesize") or f.get("filesize_approx", 0)
+            size_str = f"{size / 1024 / 1024:.1f}MB" if size else "?"
+            vcodec = f.get("vcodec", "none")[:4]
+            acodec = f.get("acodec", "none")[:4]
+            if vcodec != "none" or acodec != "none":
+                opciones.append(f)
+                print(f"   [{i:2d}] {ext:4s} | {nota:10s} | {size_str:>7s} | V:{vcodec} A:{acodec}")
+
+        if not opciones:
+            print("   No hay formatos disponibles.")
+            return
+
+        try:
+            eleccion = int(input(f"\nSelecciona formato [0-{len(opciones)-1}]: "))
+            if eleccion < 0 or eleccion >= len(opciones):
+                print("   Opcion invalida")
+                return
+        except ValueError:
+            print("   Entrada invalida")
+            return
+
+        fmt_id = opciones[eleccion].get("format_id", "best")
+        dl_opts = {
+            "outtmpl": os.path.join(destino, "video", "%(title)s.%(ext)s"),
+            "format": fmt_id,
+            "progress_hooks": [hook_progreso],
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            ydl.download([url])
+        print(f"\n   Descarga completada")
+
+    except Exception as e:
+        print(f"   Error: {e}")
+
+
+def ejecutar_descarga(url, tipo, destino):
+    """Rutea la descarga segun el tipo seleccionado"""
+    try:
+        if tipo == "1":
+            descargar_video(url, destino)
+        elif tipo == "2":
+            descargar_con_formato(url, destino)
+        elif tipo == "3":
+            descargar_audio(url, destino)
+    except Exception as e:
+        print(f"\nError descargando {url}: {e}")
+
+
+# --- Archivo de enlaces ---------------------------------
+
+def procesar_archivo(ruta):
+    """Lee URLs desde un archivo de texto"""
+    enlaces = []
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            for linea in f:
+                linea = linea.strip()
+                if linea and not linea.startswith("#"):
+                    enlaces.append(linea)
+        return enlaces
+    except Exception as e:
+        print(f"Error leyendo archivo: {e}")
+        return []
+
+
+# --- Informacion del video ------------------------------
+
+def mostrar_info(url):
+    """Muestra informacion del video sin descargar"""
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        print(f"\nTitulo: {info.get('title', '?')}")
+        print(f"Autor: {info.get('uploader', '?')}")
+        print(f"Duracion: {info.get('duration_string', '?')}")
+        return True
+    except Exception as e:
+        print(f"\nNo se pudo obtener informacion: {e}")
+        return False
+
+
+# --- Menus ----------------------------------------------
+
+def menu_principal():
+    limpiar_pantalla()
+    print("=" * 52)
+    print("     UNIVERSAL VIDEO DOWNLOADER")
+    print("   YouTube | TikTok | Facebook | Instagram | Twitter")
+    print("=" * 52)
+    return input(
+        "\n   Selecciona una opcion:\n"
+        "     1. Descargar un enlace\n"
+        "     2. Descargar desde archivo (lote)\n"
+        "     3. Salir\n\n"
+        "   Opcion (1|2|3): "
+    ).strip()
+
+
+def menu_tipo_descarga():
+    limpiar_pantalla()
+    print("=" * 52)
+    print("   TIPO DE DESCARGA")
+    print("=" * 52)
+    return input(
+        "\n   Que deseas descargar?\n"
+        "     1. Video + Audio (mejor calidad)\n"
+        "     2. Video (seleccionar formato)\n"
+        "     3. Solo Audio (MP3 192kbps)\n\n"
+        "   Opcion (1|2|3): "
+    ).strip()
+
+
+# --- Main -----------------------------------------------
+
+def main():
+    verificar_actualizaciones()
+
+    destino = obtener_ruta_descargas()
+    crear_directorios(destino)
+
+    while True:
+        tarea = menu_principal()
+
+        if tarea == "3":
+            limpiar_pantalla()
+            print("Hasta luego!")
+            break
+
+        enlaces = []
+        modo_lote = False
+
+        if tarea == "1":
+            limpiar_pantalla()
+            url = input("URL del video: ").strip()
+            if url:
+                enlaces.append(url)
+            else:
+                input("URL vacia. Presiona Enter...")
+                continue
+
+        elif tarea == "2":
+            modo_lote = True
+            limpiar_pantalla()
+            ruta = input("Ruta del archivo de enlaces: ").strip()
+            enlaces = procesar_archivo(ruta)
+            if not enlaces:
+                input("No se encontraron enlaces. Presiona Enter...")
+                continue
+        else:
+            input("Opcion invalida. Presiona Enter...")
+            continue
+
+        tipo = ""
+        while tipo not in ["1", "2", "3"]:
+            tipo = menu_tipo_descarga()
+
+        limpiar_pantalla()
+        for i, url in enumerate(enlaces, 1):
+            if modo_lote:
+                print(f"\n--- [{i}/{len(enlaces)}] Procesando enlace ---")
+            mostrar_info(url)
+            ejecutar_descarga(url, tipo, destino)
+            print("\n" + "-" * 52)
+
+        input("\nPresiona Enter para volver al menu...")
+
+
+if __name__ == "__main__":
+    main()
