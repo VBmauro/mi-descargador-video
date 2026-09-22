@@ -51,58 +51,25 @@ def load_ytdlp():
         yt_dlp = ytdlp_module
         return True
     except ImportError:
+        # Si falla aqui, el yt-dlp que espera la app no es importable desde esta
+        # instalacion. Se reporta para diagnosticar en el log de la consola.
+        print("[UDL] AVISO: no se puede importar yt_dlp. Reinstala la app.")
         return False
 
 def verificar_actualizaciones():
+    # IMPORTANTE: Este auto-update estaba DESCARGANDO el binario ejecutable de
+    # GitHub (yt-dlp) y guardandolo como "yt-dlp.zipapp", corrompiendo el paquete
+    # importable que se necesita con 'import yt_dlp'. Eso es lo que hizo que la
+    # app dejara de funcionar "de un dia para otro". Se DESACTIVA la sobrescritura
+    # automatica: yt-dlp viene instalado correctamente dentro del APK (requirements).
     global yt_dlp
     load_ytdlp()
-    
-    import urllib.request
-    import json
-    import ssl
-    
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        
-        req = urllib.request.Request("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", headers={"User-Agent": "UniversalDownloader/2.2"})
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
-            data = json.loads(response.read().decode())
-            latest_version = data["tag_name"]
-            if latest_version.startswith("v"):
-                latest_version = latest_version[1:]
-            
-            current_version = ""
-            if yt_dlp:
-                try:
-                    current_version = yt_dlp.version.__version__
-                except:
-                    pass
-            
-            if current_version != latest_version:
-                download_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
-                path = get_ytdlp_path()
-                tmp_path = path + ".tmp"
-                
-                with urllib.request.urlopen(download_url, timeout=60, context=ctx) as dl_resp:
-                    with open(tmp_path, "wb") as f:
-                        f.write(dl_resp.read())
-                
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except:
-                        pass
-                os.rename(tmp_path, path)
-                
-                if yt_dlp:
-                    import importlib
-                    importlib.reload(yt_dlp)
-                else:
-                    load_ytdlp()
+        if yt_dlp:
+            ver = getattr(getattr(yt_dlp, "version", None), "__version__", "?")
+            print("[UDL] yt-dlp instalado:", ver)
     except Exception as e:
-        print("Error actualizando yt-dlp:", e)
+        print("Error leyendo version yt-dlp:", e)
 
 
 # --- Utilidades ---
@@ -112,6 +79,63 @@ def _tiene_ffmpeg():
         return True
     except:
         return False
+
+
+# Clientes de YouTube a probar en orden (ninguno es universal en 2026:
+# YouTube bloquea segun IP/sesion). El primero es el mas fiable sin JS runtime.
+_YT_CLIENTS = ["android", "android_vr", "ios", "mweb", "tv", "web_safari", "web"]
+
+
+def _es_youtube(url):
+    u = (url or "").lower()
+    return "youtube.com" in u or "youtu.be" in u
+
+
+def _opts_yt(base_opts, cliente):
+    """Agrega extractor_args con un player_client concreto para YouTube."""
+    if not cliente:
+        return base_opts
+    opts = dict(base_opts)
+    opts.setdefault("extractor_args", {})["youtube"] = {"player_client": [cliente]}
+    return opts
+
+
+class _SafeLogger:
+    """Logger que evita que yt-dlp use stderr(stdout directamente en Android."""
+    def __init__(self, log_func=None):
+        self.log_func = log_func
+    def debug(self, msg):
+        pass
+    def warning(self, msg):
+        if self.log_func:
+            self.log_func(msg)
+    def error(self, msg):
+        if self.log_func:
+            self.log_func(msg)
+        try:
+            sys.stderr.write(f"[YTDLP] {msg}\n")
+        except Exception:
+            pass
+
+
+def _descargar_con_retry(url, ydl_opts, log_func=None):
+    """Descarga probando varios player_clients de YouTube en orden."""
+    clientes = _YT_CLIENTS if _es_youtube(url) else [None]
+    ultimo_err = None
+    for cl in clientes:
+        opts = _opts_yt(ydl_opts, cl)
+        if log_func:
+            log_func(f"Probando: {cl or 'cliente por defecto'}...")
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            return True
+        except Exception as e:
+            ultimo_err = e
+            continue
+    if ultimo_err:
+        raise ultimo_err
+    return False
 
 
 def obtener_ruta_descargas():
@@ -262,13 +286,9 @@ class DownloadScreen(BoxLayout):
             return
 
         try:
-            # Mostrar info
-            try:
-                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                Clock.schedule_once(lambda dt: self._mostrar_info(info))
-            except Exception as e:
-                Clock.schedule_once(lambda dt, e=e: self.set_status(f"Error obteniendo info: {str(e)[:50]}", (1, 0, 0, 1)))
+            # Mostrar info (con retry de clientes YouTube para no bloquearse)
+            info = self._extraer_info_soporta_retry(url)
+            Clock.schedule_once(lambda dt: self._mostrar_info(info))
 
             if modo == "1":
                 self._descargar_video(url)
@@ -281,6 +301,28 @@ class DownloadScreen(BoxLayout):
             Clock.schedule_once(lambda dt, e=e: self.set_status(f"Error: {str(e)[:60]}", (1, 0, 0, 1)))
         finally:
             Clock.schedule_once(lambda dt: self._finalizar())
+
+    def _extraer_info_soporta_retry(self, url):
+        """Extrae info probando varios player_clients en YouTube (2026)."""
+        clientes = _YT_CLIENTS if _es_youtube(url) else [None]
+        ultimo_err = None
+        for cl in clientes:
+            base = {
+                "quiet": True,
+                "no_warnings": True,
+                "logger": _SafeLogger(),
+                "socket_timeout": 30,
+                "retries": 2,
+            }
+            if _es_youtube(url):
+                base["extractor_args"] = {"youtube": {"player_client": [cl]}}
+            try:
+                with yt_dlp.YoutubeDL(base) as ydl:
+                    return ydl.extract_info(url, download=False)
+            except Exception as e:
+                ultimo_err = e
+                continue
+        raise ultimo_err if ultimo_err else Exception("No se pudo obtener la info")
 
     def _mostrar_info(self, info):
         txt = (
@@ -303,11 +345,13 @@ class DownloadScreen(BoxLayout):
             "format": formato,
             "merge_output_format": "mp4",
             "progress_hooks": [self._hook_progreso],
+            "logger": _SafeLogger(lambda m: self.log(m)),
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 60,
+            "retries": 3,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        _descargar_con_retry(url, ydl_opts, lambda m: self.log(m))
         Clock.schedule_once(lambda dt: self.set_status("Video descargado!", (0, 1, 0, 1)))
 
     def _descargar_audio(self, url):
@@ -316,8 +360,11 @@ class DownloadScreen(BoxLayout):
             "outtmpl": os.path.join(self.ruta_descargas, "audio", "%(title)s.%(ext)s"),
             "format": "bestaudio/best",
             "progress_hooks": [self._hook_progreso],
+            "logger": _SafeLogger(lambda m: self.log(m)),
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 60,
+            "retries": 3,
         }
         if _tiene_ffmpeg():
             ydl_opts["postprocessors"] = [{
@@ -328,8 +375,7 @@ class DownloadScreen(BoxLayout):
         else:
             self.log("Sin ffmpeg: audio en formato original")
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        _descargar_con_retry(url, ydl_opts, lambda m: self.log(m))
         Clock.schedule_once(lambda dt: self.set_status("Audio descargado!", (0, 1, 0, 1)))
 
     def _descargar_con_formato(self, url):
@@ -344,11 +390,13 @@ class DownloadScreen(BoxLayout):
             "format": formato,
             "merge_output_format": "mp4",
             "progress_hooks": [self._hook_progreso],
+            "logger": _SafeLogger(lambda m: self.log(m)),
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 60,
+            "retries": 3,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        _descargar_con_retry(url, ydl_opts, lambda m: self.log(m))
         Clock.schedule_once(lambda dt: self.set_status("Video descargado!", (0, 1, 0, 1)))
 
     def _hook_progreso(self, d):
